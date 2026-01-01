@@ -1,10 +1,15 @@
-"""mGBA emulator wrapper for headless operation."""
+"""mGBA emulator wrapper for headless operation.
 
-import base64
+Uses a watchdog pattern since emu:quit() doesn't reliably terminate mGBA.
+Scripts write a DONE marker file when complete, and we kill the process.
+"""
+
 import json
 import os
+import signal
 import subprocess
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -21,12 +26,38 @@ class EmulatorResult:
 
 
 class MGBAEmulator:
-    """Wrapper for mGBA-qt headless operation via Lua scripts."""
+    """Wrapper for mGBA-qt headless operation via Lua scripts.
+
+    Uses watchdog pattern: scripts write a DONE file when complete,
+    then we forcefully terminate the process since emu:quit() is unreliable.
+    """
 
     def __init__(self, mgba_path: str = "mgba-qt", use_xvfb: bool = True):
         self.mgba_path = mgba_path
         self.use_xvfb = use_xvfb
         self.temp_dir = Path(tempfile.mkdtemp(prefix="mgba_mcp_"))
+        self._done_marker = "MGBA_SCRIPT_DONE"
+
+    def _kill_process_tree(self, proc: subprocess.Popen):
+        """Kill process and all children (handles xvfb-run wrapper)."""
+        try:
+            # Try SIGTERM first
+            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+            time.sleep(0.2)
+        except (ProcessLookupError, PermissionError):
+            pass
+
+        try:
+            # Force kill if still running
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+
+        # Also try direct kill
+        try:
+            proc.kill()
+        except (ProcessLookupError, PermissionError):
+            pass
 
     def _run_with_lua(
         self,
@@ -35,11 +66,23 @@ class MGBAEmulator:
         savestate_path: Optional[str] = None,
         timeout: int = 30,
     ) -> EmulatorResult:
-        """Run mGBA with a Lua script and return results."""
+        """Run mGBA with a Lua script and return results.
+
+        Uses watchdog pattern: polls for DONE marker file, then kills process.
+        """
         # Convert paths to absolute (subprocess runs in temp_dir)
         rom_path = str(Path(rom_path).resolve())
         if savestate_path:
             savestate_path = str(Path(savestate_path).resolve())
+
+        # Clean up any previous run
+        done_file = self.temp_dir / "DONE"
+        if done_file.exists():
+            done_file.unlink()
+        for f in ["screenshot.png", "output.json"]:
+            p = self.temp_dir / f
+            if p.exists():
+                p.unlink()
 
         # Write Lua script to temp file
         lua_file = self.temp_dir / "script.lua"
@@ -57,21 +100,37 @@ class MGBAEmulator:
 
         cmd.extend(["--script", str(lua_file), "-l", "0"])
 
-        # Disable audio to prevent sound during headless testing
-        env = os.environ.copy()
-        env["SDL_AUDIODRIVER"] = "dummy"
-
         try:
-            result = subprocess.run(
+            # Start process in new process group for clean kill
+            proc = subprocess.Popen(
                 cmd,
-                capture_output=True,
-                text=True,
-                timeout=timeout,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 cwd=str(self.temp_dir),
-                env=env,
+                start_new_session=True,
             )
 
-            # Check for output files
+            # Poll for DONE file or timeout
+            start_time = time.time()
+            poll_interval = 0.1  # 100ms
+
+            while time.time() - start_time < timeout:
+                # Check if script wrote DONE marker
+                if done_file.exists():
+                    # Give script a moment to finish writing files
+                    time.sleep(0.1)
+                    break
+
+                # Check if process died
+                if proc.poll() is not None:
+                    break
+
+                time.sleep(poll_interval)
+
+            # Kill the process (emu:quit() doesn't work reliably)
+            self._kill_process_tree(proc)
+
+            # Collect output files
             screenshot_path = self.temp_dir / "screenshot.png"
             output_path = self.temp_dir / "output.json"
 
@@ -86,33 +145,8 @@ class MGBAEmulator:
                 except json.JSONDecodeError:
                     pass
 
-            return EmulatorResult(
-                success=result.returncode == 0,
-                screenshot=screenshot,
-                output=result.stdout,
-                error=result.stderr if result.returncode != 0 else None,
-                data=output_data,
-            )
-
-        except subprocess.TimeoutExpired:
-            # mGBA often doesn't exit cleanly under xvfb, but may have produced output
-            # Check for output files anyway
-            screenshot_path = self.temp_dir / "screenshot.png"
-            output_path = self.temp_dir / "output.json"
-
-            screenshot = None
-            if screenshot_path.exists():
-                screenshot = screenshot_path.read_bytes()
-
-            output_data = None
-            if output_path.exists():
-                try:
-                    output_data = json.loads(output_path.read_text())
-                except json.JSONDecodeError:
-                    pass
-
-            # If we got output, consider it a success despite timeout
-            if screenshot or output_data:
+            # Success if we got expected output
+            if screenshot or output_data or done_file.exists():
                 return EmulatorResult(
                     success=True,
                     screenshot=screenshot,
@@ -121,8 +155,9 @@ class MGBAEmulator:
 
             return EmulatorResult(
                 success=False,
-                error=f"Emulator timed out after {timeout}s",
+                error=f"Emulator timed out after {timeout}s without producing output",
             )
+
         except Exception as e:
             return EmulatorResult(
                 success=False,
@@ -148,7 +183,9 @@ callbacks:add("frame", function()
         if take_screenshot then
             emu:screenshot("screenshot.png")
         end
-        emu:quit()
+        -- Write DONE marker (emu:quit() is unreliable)
+        local f = io.open("DONE", "w")
+        if f then f:write("OK"); f:close() end
     end
 end)
 """
@@ -181,7 +218,9 @@ callbacks:add("frame", function()
             f:close()
         end
         emu:screenshot("screenshot.png")
-        emu:quit()
+        -- Write DONE marker
+        local done = io.open("DONE", "w")
+        if done then done:write("OK"); done:close() end
     end
 end)
 """
@@ -213,7 +252,9 @@ callbacks:add("frame", function()
             f:close()
         end
         emu:screenshot("screenshot.png")
-        emu:quit()
+        -- Write DONE marker
+        local done = io.open("DONE", "w")
+        if done then done:write("OK"); done:close() end
     end
 end)
 """
@@ -252,7 +293,9 @@ callbacks:add("frame", function()
             f:close()
         end
         emu:screenshot("screenshot.png")
-        emu:quit()
+        -- Write DONE marker
+        local done = io.open("DONE", "w")
+        if done then done:write("OK"); done:close() end
     end
 end)
 """
@@ -291,7 +334,9 @@ callbacks:add("frame", function()
             f:close()
         end
         emu:screenshot("screenshot.png")
-        emu:quit()
+        -- Write DONE marker
+        local done = io.open("DONE", "w")
+        if done then done:write("OK"); done:close() end
     end
 end)
 """
