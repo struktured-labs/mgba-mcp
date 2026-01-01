@@ -36,6 +36,11 @@ class MGBAEmulator:
         timeout: int = 30,
     ) -> EmulatorResult:
         """Run mGBA with a Lua script and return results."""
+        # Convert paths to absolute (subprocess runs in temp_dir)
+        rom_path = str(Path(rom_path).resolve())
+        if savestate_path:
+            savestate_path = str(Path(savestate_path).resolve())
+
         # Write Lua script to temp file
         lua_file = self.temp_dir / "script.lua"
         lua_file.write_text(lua_script)
@@ -52,6 +57,10 @@ class MGBAEmulator:
 
         cmd.extend(["--script", str(lua_file), "-l", "0"])
 
+        # Disable audio to prevent sound during headless testing
+        env = os.environ.copy()
+        env["SDL_AUDIODRIVER"] = "dummy"
+
         try:
             result = subprocess.run(
                 cmd,
@@ -59,6 +68,7 @@ class MGBAEmulator:
                 text=True,
                 timeout=timeout,
                 cwd=str(self.temp_dir),
+                env=env,
             )
 
             # Check for output files
@@ -85,6 +95,30 @@ class MGBAEmulator:
             )
 
         except subprocess.TimeoutExpired:
+            # mGBA often doesn't exit cleanly under xvfb, but may have produced output
+            # Check for output files anyway
+            screenshot_path = self.temp_dir / "screenshot.png"
+            output_path = self.temp_dir / "output.json"
+
+            screenshot = None
+            if screenshot_path.exists():
+                screenshot = screenshot_path.read_bytes()
+
+            output_data = None
+            if output_path.exists():
+                try:
+                    output_data = json.loads(output_path.read_text())
+                except json.JSONDecodeError:
+                    pass
+
+            # If we got output, consider it a success despite timeout
+            if screenshot or output_data:
+                return EmulatorResult(
+                    success=True,
+                    screenshot=screenshot,
+                    data=output_data,
+                )
+
             return EmulatorResult(
                 success=False,
                 error=f"Emulator timed out after {timeout}s",
