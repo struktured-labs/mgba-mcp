@@ -101,6 +101,10 @@ class MGBAEmulator:
         cmd.extend(["--script", str(lua_file), "-l", "0"])
 
         try:
+            # Disable audio to prevent sound leakage in headless mode
+            env = os.environ.copy()
+            env["SDL_AUDIODRIVER"] = "dummy"
+
             # Start process in new process group for clean kill
             proc = subprocess.Popen(
                 cmd,
@@ -108,6 +112,7 @@ class MGBAEmulator:
                 stderr=subprocess.PIPE,
                 cwd=str(self.temp_dir),
                 start_new_session=True,
+                env=env,
             )
 
             # Poll for DONE file or timeout
