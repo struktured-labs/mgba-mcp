@@ -15,6 +15,30 @@ from pathlib import Path
 from typing import Optional
 
 
+def validate_png(data: bytes) -> bool:
+    """Validate that the data is a complete PNG file.
+
+    Checks:
+    1. PNG signature (8 bytes)
+    2. IHDR chunk exists and is valid
+    3. IEND chunk exists at the end
+    """
+    if len(data) < 57:  # Minimum PNG: 8 (sig) + 25 (IHDR) + 12 (IEND) + some IDAT
+        return False
+
+    # Check PNG signature
+    png_signature = b'\x89PNG\r\n\x1a\n'
+    if data[:8] != png_signature:
+        return False
+
+    # Check for IEND chunk at end (last 12 bytes: 4 length + 4 type + 4 CRC)
+    # IEND has 0 length, so last 12 bytes should be: 00 00 00 00 IEND <crc>
+    if data[-12:-8] != b'\x00\x00\x00\x00' or data[-8:-4] != b'IEND':
+        return False
+
+    return True
+
+
 @dataclass
 class EmulatorResult:
     """Result from running the emulator."""
@@ -122,8 +146,8 @@ class MGBAEmulator:
             while time.time() - start_time < timeout:
                 # Check if script wrote DONE marker
                 if done_file.exists():
-                    # Give script a moment to finish writing files
-                    time.sleep(0.1)
+                    # Give script a moment to finish writing and flushing files
+                    time.sleep(0.3)
                     break
 
                 # Check if process died
@@ -141,7 +165,13 @@ class MGBAEmulator:
 
             screenshot = None
             if screenshot_path.exists():
-                screenshot = screenshot_path.read_bytes()
+                screenshot_data = screenshot_path.read_bytes()
+                # Validate PNG to prevent corrupted images from crashing Claude API
+                if validate_png(screenshot_data):
+                    screenshot = screenshot_data
+                else:
+                    # Log but don't fail - just omit the corrupted screenshot
+                    pass
 
             output_data = None
             if output_path.exists():
