@@ -15,28 +15,68 @@ from pathlib import Path
 from typing import Optional
 
 
-def validate_png(data: bytes) -> bool:
-    """Validate that the data is a complete PNG file.
+def validate_and_normalize_png(data: bytes) -> tuple[bytes | None, str]:
+    """Validate and normalize PNG data for Claude API compatibility.
+
+    Returns:
+        (normalized_png_bytes, error_message) - bytes is None if invalid
 
     Checks:
     1. PNG signature (8 bytes)
     2. IHDR chunk exists and is valid
     3. IEND chunk exists at the end
+    4. Image can be decoded by PIL (catches corruption)
+    5. Dimensions are within expected Game Boy bounds
+
+    Normalization:
+    - Converts palette/grayscale to RGB for consistent API handling
+    - Re-encodes to ensure clean PNG structure
     """
     if len(data) < 57:  # Minimum PNG: 8 (sig) + 25 (IHDR) + 12 (IEND) + some IDAT
-        return False
+        return None, f"PNG too small: {len(data)} bytes"
 
     # Check PNG signature
     png_signature = b'\x89PNG\r\n\x1a\n'
     if data[:8] != png_signature:
-        return False
+        return None, "Invalid PNG signature"
 
     # Check for IEND chunk at end (last 12 bytes: 4 length + 4 type + 4 CRC)
     # IEND has 0 length, so last 12 bytes should be: 00 00 00 00 IEND <crc>
     if data[-12:-8] != b'\x00\x00\x00\x00' or data[-8:-4] != b'IEND':
-        return False
+        return None, "Missing or invalid IEND chunk"
 
-    return True
+    # Try to actually decode and normalize the image with PIL
+    try:
+        from io import BytesIO
+        from PIL import Image
+
+        img = Image.open(BytesIO(data))
+        img.load()  # Force full decode
+
+        # Check dimensions - GB/GBC is 160x144, GBA is 240x160
+        width, height = img.size
+        if width < 10 or height < 10:
+            return None, f"Image too small: {width}x{height}"
+        if width > 500 or height > 500:
+            return None, f"Image too large: {width}x{height}"
+
+        # Convert to RGB to ensure Claude API compatibility
+        # (handles palette mode, grayscale, etc.)
+        if img.mode != 'RGB':
+            img = img.convert('RGB')
+
+        # Re-encode as PNG
+        output = BytesIO()
+        img.save(output, format='PNG', optimize=True)
+        return output.getvalue(), ""
+
+    except ImportError:
+        # PIL not available, return original data with warning
+        import sys
+        print("Warning: PIL not available for PNG normalization", file=sys.stderr)
+        return data, ""
+    except Exception as e:
+        return None, f"PIL decode/normalize failed: {e}"
 
 
 @dataclass
@@ -146,8 +186,18 @@ class MGBAEmulator:
             while time.time() - start_time < timeout:
                 # Check if script wrote DONE marker
                 if done_file.exists():
-                    # Give script a moment to finish writing and flushing files
-                    time.sleep(0.3)
+                    # Give script time to finish writing and flushing files
+                    # mGBA screenshot can be slow to flush
+                    time.sleep(0.5)
+                    # Double-check screenshot file is stable (not still being written)
+                    screenshot_path = self.temp_dir / "screenshot.png"
+                    if screenshot_path.exists():
+                        size1 = screenshot_path.stat().st_size
+                        time.sleep(0.1)
+                        size2 = screenshot_path.stat().st_size
+                        if size1 != size2:
+                            # File still growing, wait more
+                            time.sleep(0.5)
                     break
 
                 # Check if process died
@@ -166,12 +216,14 @@ class MGBAEmulator:
             screenshot = None
             if screenshot_path.exists():
                 screenshot_data = screenshot_path.read_bytes()
-                # Validate PNG to prevent corrupted images from crashing Claude API
-                if validate_png(screenshot_data):
-                    screenshot = screenshot_data
+                # Validate and normalize PNG for Claude API compatibility
+                normalized_data, error_msg = validate_and_normalize_png(screenshot_data)
+                if normalized_data:
+                    screenshot = normalized_data
                 else:
-                    # Log but don't fail - just omit the corrupted screenshot
-                    pass
+                    # Log validation failure for debugging
+                    import sys
+                    print(f"PNG validation failed: {error_msg} (size={len(screenshot_data)})", file=sys.stderr)
 
             output_data = None
             if output_path.exists():
