@@ -169,10 +169,17 @@ class MGBAEmulator:
             env = os.environ.copy()
             env["SDL_AUDIODRIVER"] = "dummy"
 
-            # Remove DISPLAY so xvfb-run creates its own virtual display
-            # Otherwise mgba-qt will try to use the user's X display
-            if self.use_xvfb and "DISPLAY" in env:
-                del env["DISPLAY"]
+            # Remove display variables so xvfb-run creates its own virtual display
+            # Otherwise mgba-qt will try to use the user's display
+            if self.use_xvfb:
+                # Remove X11 display
+                if "DISPLAY" in env:
+                    del env["DISPLAY"]
+                # Remove Wayland display (Qt prefers Wayland if available)
+                if "WAYLAND_DISPLAY" in env:
+                    del env["WAYLAND_DISPLAY"]
+                # Force Qt to use X11 (xcb) platform, not Wayland
+                env["QT_QPA_PLATFORM"] = "xcb"
 
             # Start process in new process group for clean kill
             proc = subprocess.Popen(
