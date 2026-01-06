@@ -169,6 +169,11 @@ class MGBAEmulator:
             env = os.environ.copy()
             env["SDL_AUDIODRIVER"] = "dummy"
 
+            # Remove DISPLAY so xvfb-run creates its own virtual display
+            # Otherwise mgba-qt will try to use the user's X display
+            if self.use_xvfb and "DISPLAY" in env:
+                del env["DISPLAY"]
+
             # Start process in new process group for clean kill
             proc = subprocess.Popen(
                 cmd,
